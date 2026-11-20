@@ -1,0 +1,64 @@
+# General-purpose Codex (OAuth) + Kimi configuration
+
+[run]
+max_workers = 3
+lease_seconds = 120
+heartbeat_seconds = 15.0
+max_total_tasks = 40
+max_follow_ups_per_task = 4
+enable_verify_phase = true
+
+[budgets]
+max_run_tokens = 2000000
+max_run_wall_seconds = 3600.0
+max_run_disk_bytes = 2147483648
+min_free_disk_bytes = 268435456
+default_task_tokens = 120000
+default_task_wall_seconds = 300.0
+default_task_memory_mb = 2048
+default_task_disk_bytes = 268435456
+max_output_bytes = 2097152
+max_same_error_repeats = 2
+
+[diversity]
+enabled = true
+knowledge_base_path = "./knowledge_base.jsonl"
+kb_samples_per_task = 2
+include_sibling_avoidance = true
+
+[routing]
+cooldown_seconds = 60.0
+
+[[routing.tiers.fast]]
+provider = "kimi"
+model = "kimi-k2-turbo-preview"
+
+[[routing.tiers.default]]
+provider = "codex"
+model = ""
+
+[[routing.tiers.default]]
+provider = "kimi"
+model = "kimi-k2-turbo-preview"
+
+[[routing.tiers.strong]]
+provider = "codex"
+model = ""
+
+[[routing.tiers.strong]]
+provider = "kimi"
+model = "kimi-k2.5"
+
+[providers.codex]
+binary = "codex"
+default_model = ""
+sandbox = "workspace-write"
+
+[providers.kimi]
+mode = "api"
+base_url = "https://api.moonshot.ai/v1"
+api_key_env = "KIMI_API_KEY"
+default_model = "kimi-k2-turbo-preview"
+cli_binary = "kimi"
+max_tool_turns = 8
+timeout_seconds = 120.0

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drostpp"
+version = "0.1.0"
+description = "drost++ — durable multi-agent orchestration engine with SQLite WAL journaling, generation fencing, diversity scheduling, Codex/Kimi adapters, and Drost MCP/workspace integration."
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+drostpp = "drostpp.cli:main"
+"drost++" = "drostpp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

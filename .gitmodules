@@ -1,0 +1,3 @@
+[submodule "drost"]
+	path = drost
+	url = https://github.com/drost-ai/drost-community.git

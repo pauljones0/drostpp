@@ -8,6 +8,7 @@ Orchestration lives cleanly **outside** Drost's per-session stdio MCP server whi
 
 - `src/drostpp/` — **drost++** coordinator, SQLite WAL state engine, blackboard, diversity scheduler, Codex/Kimi adapters, process-group supervisor, and Drost bridge.
 - `drost/` — Git submodule pointing to [`drost-ai/drost-community`](https://github.com/drost-ai/drost-community) (Apache-2.0).
+- `background/analysis/` — Architectural findings, post-mortems, and corpus manifests across 51 evaluated agent/orchestration repositories ([`background/analysis/README.md`](background/analysis/README.md)).
 - `examples/` — Sample configurations (`config.toml`, `config.drost.toml`) and exploration seed knowledge base (`knowledge_base.jsonl`).
 - `tests/` — Offline reliability, fencing, recovery, diversity, adapter, and Drost bridge test suite.
 

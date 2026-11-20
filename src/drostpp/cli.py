@@ -11,10 +11,11 @@ import shutil
 import sys
 from typing import Any
 
-from .config import OrchestratorConfig, config_to_toml, load_config
+from .config import OrchestratorConfig, config_from_dict, config_to_toml, load_config
 from .coordinator import Coordinator
 from .integrations.drost import DrostWorkspaceBridge, check_drost_health
 from .models import BlackboardKind, RunPhase, TaskKind
+from .resources import ResourceManager
 from .store import SQLiteStore
 
 
@@ -135,6 +136,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         attempts = store.list_attempts(run_id)
         bb = store.list_blackboard_entries(run_id)
         artifacts = store.list_artifacts(run_id)
+        resources = store.list_managed_resources(run_id)
         payload = {
             "run": asdict(run_rec),
             "task_counts": {
@@ -155,6 +157,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "attempts_total": len(attempts),
             "blackboard_entries": len(bb),
             "artifacts": len(artifacts),
+            "managed_resources": [asdict(resource) for resource in resources],
         }
         if args.json:
             _print_json(payload)
@@ -166,6 +169,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
             )
             for t in tasks:
                 print(f"  - [{t.status}] {t.task_id} ({t.kind}/gen={t.generation}): {t.title}")
+            for resource in resources:
+                print(
+                    f"  - [resource/{resource.status}] {resource.resource_key}: "
+                    f"{resource.name} ({resource.external_id[:12]})"
+                )
         return 0
     finally:
         store.close()
@@ -178,6 +186,15 @@ def _cmd_phase_op(args: argparse.Namespace, target: RunPhase) -> int:
         updated = store.transition_run_phase(
             run_id, target, actor="operator", reason=f"cli {target}"
         )
+        if target in (RunPhase.PAUSED, RunPhase.CANCELLED):
+            cfg = config_from_dict(json.loads(updated.config_json))
+            ResourceManager(
+                store,
+                cfg.container,
+                attempt_lease_seconds=cfg.run.lease_seconds,
+                min_available_memory_mb=cfg.budgets.min_available_memory_mb,
+                min_free_disk_bytes=cfg.budgets.min_free_disk_bytes,
+            ).close_run(run_id)
         _print_json({"run_id": updated.run_id, "phase": updated.phase})
         return 0
     finally:
@@ -244,6 +261,129 @@ def _cmd_events(args: argparse.Namespace) -> int:
         run_id = _resolve_run_id(store, args.run_id)
         _print_json(store.list_events(run_id, after_seq=args.after))
         return 0
+    finally:
+        store.close()
+
+
+def _resource_attempt_context(
+    store: SQLiteStore, args: argparse.Namespace
+) -> tuple[str, str, str, int]:
+    run_id = args.run_id or os.environ.get("DROSTPP_RUN_ID")
+    task_id = getattr(args, "task_id", None) or os.environ.get("DROSTPP_TASK_ID")
+    attempt_id = getattr(args, "attempt_id", None) or os.environ.get("DROSTPP_ATTEMPT_ID")
+    generation_raw = getattr(args, "generation", None)
+    if generation_raw is None:
+        generation_raw = os.environ.get("DROSTPP_GENERATION")
+    if not run_id or not task_id or not attempt_id or generation_raw is None:
+        raise SystemExit(
+            "resource mutation requires an active Drost++ attempt environment "
+            "(run/task/attempt/generation)"
+        )
+    try:
+        generation = int(generation_raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit("invalid DROSTPP_GENERATION") from exc
+    attempt = store.get_attempt(attempt_id)
+    if (
+        attempt is None
+        or attempt.run_id != run_id
+        or attempt.task_id != task_id
+        or attempt.generation != generation
+    ):
+        raise SystemExit("resource attempt context does not match durable state")
+    return run_id, task_id, attempt_id, generation
+
+
+def _resource_manager_for_run(
+    store: SQLiteStore, run_id: str, *, require_enabled: bool = True
+) -> ResourceManager:
+    run = store.get_run(run_id)
+    if run is None:
+        raise SystemExit(f"unknown run_id: {run_id}")
+    cfg = config_from_dict(json.loads(run.config_json))
+    if require_enabled and not cfg.container.enabled:
+        raise SystemExit("managed containers are disabled for this run")
+    return ResourceManager(
+        store,
+        cfg.container,
+        attempt_lease_seconds=cfg.run.lease_seconds,
+        min_available_memory_mb=cfg.budgets.min_available_memory_mb,
+        min_free_disk_bytes=cfg.budgets.min_free_disk_bytes,
+    )
+
+
+def _strip_remainder_separator(command: list[str]) -> list[str]:
+    return command[1:] if command and command[0] == "--" else command
+
+
+def _cmd_resource(args: argparse.Namespace) -> int:
+    state_dir = Path(args.state_dir).resolve()
+    store = SQLiteStore(state_dir / "drostpp.db")
+    try:
+        if args.resource_cmd == "list":
+            run_id = args.run_id or os.environ.get("DROSTPP_RUN_ID")
+            run_id = _resolve_run_id(store, run_id)
+            manager = _resource_manager_for_run(store, run_id, require_enabled=False)
+            payload = []
+            for resource in store.list_managed_resources(run_id):
+                payload.append(manager.describe(resource))
+            _print_json(payload)
+            return 0
+
+        run_id, task_id, attempt_id, generation = _resource_attempt_context(store, args)
+        manager = _resource_manager_for_run(store, run_id)
+        if args.resource_cmd == "start":
+            env: dict[str, str] = {}
+            for item in args.env:
+                if "=" not in item:
+                    raise SystemExit(f"invalid --env value {item!r}; expected NAME=VALUE")
+                key, value = item.split("=", 1)
+                if not key:
+                    raise SystemExit("environment variable name must not be empty")
+                env[key] = value
+            resource = manager.start_container(
+                run_id=run_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                generation=generation,
+                resource_key=args.key,
+                image=args.image,
+                command=_strip_remainder_separator(args.command),
+                env=env,
+                publish_container_ports=args.publish,
+            )
+            _print_json(manager.describe(resource))
+            return 0
+        if args.resource_cmd == "borrow":
+            resource = manager.borrow_container(
+                run_id=run_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                generation=generation,
+                resource_key=args.key,
+            )
+            _print_json(manager.describe(resource))
+            return 0
+        if args.resource_cmd == "exec":
+            command = _strip_remainder_separator(args.command)
+            if not command:
+                raise SystemExit("resource exec requires a command after --")
+            _resource, returncode, stdout, stderr = manager.exec_container(
+                run_id=run_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                generation=generation,
+                resource_key=args.key,
+                command=command,
+                timeout=args.timeout,
+            )
+            sys.stdout.write(stdout)
+            sys.stderr.write(stderr)
+            return returncode
+        if args.resource_cmd == "release":
+            _print_json(manager.release_container(attempt_id, args.key))
+            return 0
+        raise SystemExit(f"unsupported resource command: {args.resource_cmd}")
     finally:
         store.close()
 
@@ -417,6 +557,55 @@ def build_parser() -> argparse.ArgumentParser:
     p_ev.add_argument("--run-id", default=None)
     p_ev.add_argument("--after", type=int, default=0)
 
+    p_resource = sub.add_parser(
+        "resource", help="Start, borrow, execute in, list, or release leased containers"
+    )
+    p_resource_sub = p_resource.add_subparsers(dest="resource_cmd", required=True)
+
+    def _add_resource_context_flags(resource_parser: argparse.ArgumentParser) -> None:
+        resource_parser.add_argument(
+            "--state-dir", default=os.environ.get("DROSTPP_STATE_DIR", ".drostpp_state")
+        )
+        resource_parser.add_argument("--run-id", default=None, help=argparse.SUPPRESS)
+        resource_parser.add_argument("--task-id", default=None, help=argparse.SUPPRESS)
+        resource_parser.add_argument("--attempt-id", default=None, help=argparse.SUPPRESS)
+        resource_parser.add_argument("--generation", type=int, default=None, help=argparse.SUPPRESS)
+
+    pr_start = p_resource_sub.add_parser("start", help="Start or borrow a capped container")
+    _add_resource_context_flags(pr_start)
+    pr_start.add_argument("--key", required=True)
+    pr_start.add_argument("--image", required=True)
+    pr_start.add_argument("--env", action="append", default=[])
+    pr_start.add_argument(
+        "--publish",
+        action="append",
+        type=int,
+        default=[],
+        metavar="CONTAINER_PORT",
+        help="Bind a container port to a random 127.0.0.1 host port",
+    )
+    pr_start.add_argument("command", nargs=argparse.REMAINDER)
+
+    pr_borrow = p_resource_sub.add_parser("borrow", help="Borrow a live managed container")
+    _add_resource_context_flags(pr_borrow)
+    pr_borrow.add_argument("--key", required=True)
+
+    pr_exec = p_resource_sub.add_parser("exec", help="Run a command in a borrowed container")
+    _add_resource_context_flags(pr_exec)
+    pr_exec.add_argument("--key", required=True)
+    pr_exec.add_argument("--timeout", type=float, default=300.0)
+    pr_exec.add_argument("command", nargs=argparse.REMAINDER)
+
+    pr_release = p_resource_sub.add_parser("release", help="Release this attempt's borrow")
+    _add_resource_context_flags(pr_release)
+    pr_release.add_argument("--key", required=True)
+
+    pr_list = p_resource_sub.add_parser("list", help="List a run's managed containers")
+    pr_list.add_argument(
+        "--state-dir", default=os.environ.get("DROSTPP_STATE_DIR", ".drostpp_state")
+    )
+    pr_list.add_argument("--run-id", default=None)
+
     p_drost = sub.add_parser("drost", help="Drost health check, engagement listing, and artifact sync")
     p_drost_sub = p_drost.add_subparsers(dest="drost_cmd", required=True)
     pd_check = p_drost_sub.add_parser("check")
@@ -461,6 +650,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_blackboard(args)
     if args.cmd == "events":
         return _cmd_events(args)
+    if args.cmd == "resource":
+        return _cmd_resource(args)
     if args.cmd == "drost":
         return _cmd_drost(args)
     if args.cmd == "doctor":

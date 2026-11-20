@@ -63,8 +63,14 @@ class BudgetTracker:
 
     def __init__(self, run_budget: RunBudget) -> None:
         self.run_budget = run_budget
+        self.min_available_memory_mb = 0
 
-    def check_run_admission(self, run: RunRecord, state_dir: Path) -> int:
+    def set_host_memory_floor(self, minimum_mb: int) -> None:
+        self.min_available_memory_mb = max(0, int(minimum_mb))
+
+    def check_run_admission(
+        self, run: RunRecord, state_dir: Path, *, reserve_memory_mb: int = 0
+    ) -> int:
         """Validate run budgets before claiming new work. Returns current disk usage bytes."""
         if run.tokens_used >= self.run_budget.max_tokens:
             raise BudgetExceededError(
@@ -92,6 +98,24 @@ class BudgetTracker:
             if free_bytes < self.run_budget.min_free_disk_bytes:
                 raise BudgetExceededError(
                     f"host free disk below safety floor ({free_bytes} < {self.run_budget.min_free_disk_bytes} bytes)"
+                )
+
+        reserved_mb = max(0, int(reserve_memory_mb))
+        if self.min_available_memory_mb > 0 or reserved_mb > 0:
+            try:
+                values = {
+                    line.split(":", 1)[0]: int(line.split()[1])
+                    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines()
+                    if ":" in line
+                }
+                available_mb = values["MemAvailable"] // 1024
+            except (OSError, KeyError, ValueError, IndexError):
+                available_mb = self.min_available_memory_mb + reserved_mb
+            required_mb = self.min_available_memory_mb + reserved_mb
+            if available_mb < required_mb:
+                raise BudgetExceededError(
+                    "host available memory cannot satisfy safety floor plus admitted work "
+                    f"({available_mb} MiB < {required_mb} MiB)"
                 )
 
         return disk_bytes

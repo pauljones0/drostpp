@@ -118,6 +118,7 @@ class CodexAdapter:
 
         argv = self.build_argv(ctx, schema_path, last_message_path)
         env = dict(os.environ)
+        env.update(ctx.env)
         if self.config.codex_home:
             env["CODEX_HOME"] = self.config.codex_home
 

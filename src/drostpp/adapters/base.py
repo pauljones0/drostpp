@@ -15,6 +15,7 @@ from ..models import (
     ErrorKind,
     FollowUpProposal,
     McpServerConfig,
+    ResourceHandoff,
     RouteTarget,
     TaskBudget,
     TaskKind,
@@ -33,6 +34,7 @@ WORKER_OUTPUT_JSON_SCHEMA: dict[str, Any] = {
         "findings",
         "notes",
         "follow_up_tasks",
+        "resource_handoffs",
         "blocker_reason",
     ],
     "properties": {
@@ -128,6 +130,18 @@ WORKER_OUTPUT_JSON_SCHEMA: dict[str, Any] = {
                 },
             },
         },
+        "resource_handoffs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["resource_key", "to_task_title"],
+                "properties": {
+                    "resource_key": {"type": "string"},
+                    "to_task_title": {"type": "string"},
+                },
+            },
+        },
         "blocker_reason": {"type": ["string", "null"]},
     },
 }
@@ -149,6 +163,7 @@ class AttemptContext:
     cancel_event: threading.Event = field(default_factory=threading.Event)
     on_runtime_attached: Callable[[int | None, int | None, str | None], None] | None = None
     on_heartbeat: Callable[[int | None, int | None, int | None], None] | None = None
+    env: dict[str, str] = field(default_factory=dict)
 
 
 class WorkerAdapter(Protocol):
@@ -292,6 +307,25 @@ def _normalize_follow_ups(raw: Any) -> list[FollowUpProposal]:
     return proposals
 
 
+def _normalize_resource_handoffs(raw: Any) -> list[ResourceHandoff]:
+    if not isinstance(raw, list):
+        return []
+    handoffs: list[ResourceHandoff] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        resource_key = str(item.get("resource_key") or "").strip()
+        to_task_title = str(item.get("to_task_title") or "").strip()
+        if resource_key and to_task_title:
+            handoffs.append(
+                ResourceHandoff(
+                    resource_key=resource_key[:80],
+                    to_task_title=to_task_title[:160],
+                )
+            )
+    return handoffs
+
+
 def parse_worker_output(raw_text: str) -> WorkerOutput:
     """Parse structured WorkerOutput JSON or gracefully wrap plain-text responses."""
     data = _extract_json_dict(raw_text)
@@ -321,6 +355,7 @@ def parse_worker_output(raw_text: str) -> WorkerOutput:
         findings=_normalize_bb_items(data.get("findings")),
         notes=_normalize_bb_items(data.get("notes")),
         follow_up_tasks=_normalize_follow_ups(data.get("follow_up_tasks")),
+        resource_handoffs=_normalize_resource_handoffs(data.get("resource_handoffs")),
         blocker_reason=str(blocker_reason) if blocker_reason else None,
         raw_text=raw_text,
     )

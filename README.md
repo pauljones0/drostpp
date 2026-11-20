@@ -27,9 +27,15 @@ Orchestration lives cleanly **outside** Drost's per-session stdio MCP server whi
 3. **Multi-Provider Adapters, Budgets & Supervision (`adapters/`, `routing.py`, `budgets.py`, `supervision.py`)**
    - **Codex (`CodexAdapter`):** runs `codex exec --ephemeral --json --output-schema ...` using your existing `$CODEX_HOME` OAuth login, forwarding enabled MCP servers (including Drost) via `-c mcp_servers.<name>.*`.
    - **Kimi (`KimiApiAdapter` / `KimiCliAdapter`):** calls Moonshot/Kimi's OpenAI-compatible HTTP API with `KIMI_API_KEY` or `MOONSHOT_API_KEY` (never written to SQLite) and bridges stdio MCP tools, or runs `kimi -p ... --output-format stream-json --auto`.
-   - **Model Router & Resource Caps:** tier/role routing (`fast`, `default`, `strong`) with quota/transient cooldown failover; run/task token, wall-time, disk-quota, free-disk floor, capped stdout/stderr buffers, repeated-error stall detection, Linux `/proc` PGID RSS watchdog, Docker container runner (`DockerRunner`), and full process-group teardown (`terminate_process_group`).
+   - **Model Router & Resource Caps:** tier/role routing (`fast`, `default`, `strong`) with quota/transient cooldown failover; run/task token, wall-time, disk-quota, free-disk and available-RAM admission floors, capped stdout/stderr buffers, repeated-error stall detection, Linux `/proc` PGID RSS watchdog, and full process-group teardown (`terminate_process_group`).
 
-4. **External Drost Integration (`integrations/mcp.py`, `integrations/drost.py`)**
+4. **Managed Container Ownership (`resources.py`, `resource_mcp.py`)**
+   - Every worker-created container has a durable SQLite resource row and one or more expiring attempt/task leases. Ownership is persisted before `docker run`; if a worker dies between Docker creation and activation, label reconciliation adopts the container back into that row. Attempt heartbeats renew borrows. Releasing the final borrow atomically makes it non-borrowable, then synchronously runs `docker rm -f`.
+   - A worker may transfer a lease only to a newly-created, explicitly named immediate follow-up. The short task reservation becomes an attempt lease when that task is claimed; an unclaimed reservation expires and is reaped.
+   - `docker run` applies hard RAM, swap, PID, and rotating-log caps. The coordinator audits Docker's writable-layer size continuously and removes containers exceeding the configured logical disk cap. `resource exec` caps captured output and removes the container after an execution timeout. New containers are rejected if aggregate task/container reservations would overcommit RAM or disk safety floors.
+   - Codex and Kimi API workers receive the broker as MCP tools; shell-capable workers can use `drost++ resource`. Direct Docker access is pointed at a dead socket by default to prevent accidental unmanaged starts, while trusted Drost and broker commands restore the coordinator endpoint.
+
+5. **External Drost Integration (`integrations/mcp.py`, `integrations/drost.py`)**
    - Connects workers to `docker exec -i -e DROST_MCP_MODE=compact ... drost-ai drost-mcp` (or `full` / filtered `DROST_TOOL_CATEGORIES`).
    - `drost++ drost check` verifies both `exit_code == 0` and `"status": "healthy"` with zero `missing_executables`.
    - `DrostWorkspaceBridge` handles defensive engagement listing, safe SHA-256 deduplicated artifact sync into the Blackboard (skipping escaping/dangling symlinks), and unique-staging `atomic_write_json`.
@@ -78,6 +84,22 @@ drost++ run --config examples/config.drost.toml \
   --goal "Review imported artifacts and organize verified findings" \
   --drost-engagement eng_20261120_0123456789abcdef0123456789abcdef
 ```
+
+### Container ownership contract
+
+Enable `[container]` (already enabled in `examples/config.drost.toml`). Workers can then use the `drostpp_resources` MCP tools or the equivalent shell commands:
+
+```bash
+# These context variables are injected automatically into a running worker.
+drost++ resource start --key target-lab --image redis:8-alpine --publish 6379 -- redis-server
+drost++ resource exec --key target-lab -- redis-cli ping
+drost++ resource list
+drost++ resource release --key target-lab
+```
+
+`resource start` returns any random loopback host-port mappings. A resource not named in `resource_handoffs` is removed when its attempt ends. A handoff must match a task title in the same response's `follow_up_tasks`; it is not an indefinite keepalive.
+
+The dead-socket guard prevents normal tools from accidentally bypassing the broker. It is not a security boundary against a malicious worker with unrestricted host root access: such a process can deliberately select the Docker socket. For hostile-code isolation, run workers without the host Docker socket and expose only the resource MCP broker.
 
 ## Development & Tests
 

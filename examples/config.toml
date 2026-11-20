@@ -13,6 +13,7 @@ max_run_tokens = 2000000
 max_run_wall_seconds = 3600.0
 max_run_disk_bytes = 2147483648
 min_free_disk_bytes = 268435456
+min_available_memory_mb = 2048
 default_task_tokens = 120000
 default_task_wall_seconds = 300.0
 default_task_memory_mb = 2048
@@ -62,3 +63,16 @@ default_model = "kimi-k2-turbo-preview"
 cli_binary = "kimi"
 max_tool_turns = 8
 timeout_seconds = 120.0
+
+[container]
+enabled = false
+block_direct_docker = true
+docker_binary = "docker"
+memory_mb = 2048
+pids_limit = 256
+read_only = false
+disk_limit_bytes = 536870912
+max_per_run = 8
+handoff_seconds = 30
+log_max_size = "10m"
+log_max_files = 3

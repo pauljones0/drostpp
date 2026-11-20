@@ -356,9 +356,12 @@ class KimiCliAdapter:
                 ctx.on_heartbeat(usage["input"], usage["output"], usage["total"])
 
         try:
+            env = dict(os.environ)
+            env.update(ctx.env)
             proc_res = self.supervisor.run(
                 argv,
                 cwd=ctx.workspace_dir or ctx.attempt_dir,
+                env=env,
                 wall_timeout=ctx.budget.max_wall_seconds,
                 max_output_bytes=ctx.budget.max_output_bytes,
                 max_memory_mb=ctx.budget.max_memory_mb,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import resource
@@ -429,10 +430,22 @@ class ProcessSupervisor:
 
 
 class DockerRunner:
-    """Builds resource-capped container run invocations and reaps labeled leftover containers."""
+    """Starts, inspects, and reaps resource-capped, Drost++-labeled containers."""
 
     def __init__(self, docker_binary: str = "docker") -> None:
         self.docker_binary = docker_binary
+
+    @staticmethod
+    def _docker_env() -> dict[str, str]:
+        """Restore the coordinator's Docker endpoint inside managed-broker subprocesses."""
+        env = dict(os.environ)
+        if "DROSTPP_REAL_DOCKER_HOST" in env:
+            real_host = env.pop("DROSTPP_REAL_DOCKER_HOST")
+            if real_host:
+                env["DOCKER_HOST"] = real_host
+            else:
+                env.pop("DOCKER_HOST", None)
+        return env
 
     def build_run_argv(
         self,
@@ -450,27 +463,48 @@ class DockerRunner:
         mounts: list[tuple[str, str, bool]] | None = None,
         env: dict[str, str] | None = None,
         workdir: str | None = None,
+        ports: list[str] | None = None,
+        detach: bool = False,
+        auto_remove: bool = True,
+        log_max_size: str | None = None,
+        log_max_files: int | None = None,
+        resource_id: str | None = None,
     ) -> list[str]:
         argv = [
             self.docker_binary,
             "run",
-            "--rm",
-            "--init",
-            "--name",
-            container_name,
-            "--memory",
-            f"{memory_mb}m",
-            "--memory-swap",
-            f"{memory_mb}m",
-            "--pids-limit",
-            str(pids_limit),
-            "--label",
-            f"drostpp.run_id={run_id}",
-            "--label",
-            f"drostpp.attempt_id={attempt_id}",
-            "--label",
-            f"drostpp.generation={generation}",
         ]
+        if detach:
+            argv.append("--detach")
+        if auto_remove:
+            argv.append("--rm")
+        argv.extend(
+            [
+                "--init",
+                "--name",
+                container_name,
+                "--memory",
+                f"{memory_mb}m",
+                "--memory-swap",
+                f"{memory_mb}m",
+                "--pids-limit",
+                str(pids_limit),
+                "--label",
+                "drostpp.managed=true",
+                "--label",
+                f"drostpp.run_id={run_id}",
+                "--label",
+                f"drostpp.attempt_id={attempt_id}",
+                "--label",
+                f"drostpp.generation={generation}",
+            ]
+        )
+        if resource_id:
+            argv.extend(["--label", f"drostpp.resource_id={resource_id}"])
+        if log_max_size:
+            argv.extend(["--log-opt", f"max-size={log_max_size}"])
+        if log_max_files is not None:
+            argv.extend(["--log-opt", f"max-file={max(1, int(log_max_files))}"])
         if network:
             argv.extend(["--network", network])
         if read_only:
@@ -482,9 +516,114 @@ class DockerRunner:
             argv.extend(["-v", f"{host_path}:{cont_path}:{mode}"])
         for k, v in (env or {}).items():
             argv.extend(["-e", f"{k}={v}"])
+        for port in ports or []:
+            argv.extend(["--publish", port])
         argv.append(image)
         argv.extend(command)
         return argv
+
+    def run_detached(self, argv: list[str], timeout: float = 60.0) -> str:
+        """Run a prepared detached invocation and return Docker's container ID."""
+        try:
+            res = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=self._docker_env(),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"failed to start managed container: {exc}") from exc
+        if res.returncode != 0:
+            message = (res.stderr or res.stdout or "docker run failed").strip()
+            raise RuntimeError(message[:2000])
+        container_id = res.stdout.strip().splitlines()[-1] if res.stdout.strip() else ""
+        if not container_id:
+            raise RuntimeError("docker run returned no container ID")
+        return container_id
+
+    def inspect_container(
+        self, container_id_or_name: str, timeout: float = 10.0
+    ) -> dict[str, object] | None:
+        """Return one Docker inspect object including SizeRw, or None when absent."""
+        if not container_id_or_name:
+            return None
+        try:
+            res = subprocess.run(
+                [
+                    self.docker_binary,
+                    "inspect",
+                    "--size",
+                    "--format",
+                    "{{json .}}",
+                    container_id_or_name,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=self._docker_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if res.returncode != 0:
+            return None
+        try:
+            parsed = json.loads(res.stdout)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    def exec_container(
+        self,
+        container_id_or_name: str,
+        command: list[str],
+        *,
+        timeout: float = 300.0,
+        max_output_bytes: int = 2 * 1024 * 1024,
+    ) -> subprocess.CompletedProcess[str]:
+        if not command:
+            raise ValueError("container exec command must not be empty")
+        try:
+            result = ProcessSupervisor().run(
+                [self.docker_binary, "exec", container_id_or_name, *command],
+                wall_timeout=timeout,
+                max_output_bytes=max_output_bytes,
+                max_memory_mb=256,
+                env=self._docker_env(),
+            )
+        except OSError as exc:
+            raise RuntimeError(f"failed to execute in managed container: {exc}") from exc
+        if result.timed_out:
+            raise RuntimeError(f"managed container exec timed out after {timeout:.1f}s")
+        if result.kill_reason:
+            raise RuntimeError(f"managed container exec was terminated: {result.kill_reason}")
+        stderr = result.stderr
+        if result.stdout_truncated or result.stderr_truncated:
+            stderr = (
+                f"{stderr.rstrip()}\nmanaged container exec output truncated at "
+                f"{max_output_bytes} bytes per stream\n"
+            ).lstrip()
+        return subprocess.CompletedProcess(
+            [self.docker_binary, "exec", container_id_or_name, *command],
+            result.returncode,
+            result.stdout,
+            stderr,
+        )
+
+    def docker_root_dir(self, timeout: float = 10.0) -> Path | None:
+        try:
+            res = subprocess.run(
+                [self.docker_binary, "info", "--format", "{{.DockerRootDir}}"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=self._docker_env(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if res.returncode != 0 or not res.stdout.strip():
+            return None
+        return Path(res.stdout.strip())
 
     def force_remove_container(self, container_id_or_name: str, timeout: float = 10.0) -> bool:
         if not container_id_or_name:
@@ -495,32 +634,32 @@ class DockerRunner:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=self._docker_env(),
             )
             return res.returncode == 0
         except (OSError, subprocess.SubprocessError):
             return False
 
-    def reap_labeled_containers(self, run_id: str, timeout: float = 10.0) -> list[str]:
+    def list_managed_containers(self, run_id: str, timeout: float = 10.0) -> list[str]:
         try:
-            ps = subprocess.run(
+            result = subprocess.run(
                 [
                     self.docker_binary,
                     "ps",
                     "-aq",
+                    "--no-trunc",
+                    "--filter",
+                    "label=drostpp.managed=true",
                     "--filter",
                     f"label=drostpp.run_id={run_id}",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=self._docker_env(),
             )
         except (OSError, subprocess.SubprocessError):
             return []
-        if ps.returncode != 0:
+        if result.returncode != 0:
             return []
-        ids = [line.strip() for line in ps.stdout.splitlines() if line.strip()]
-        removed: list[str] = []
-        for cid in ids:
-            if self.force_remove_container(cid, timeout=timeout):
-                removed.append(cid)
-        return removed
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]

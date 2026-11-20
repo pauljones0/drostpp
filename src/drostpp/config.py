@@ -12,6 +12,14 @@ from .models import McpServerConfig, RouteTarget, RunBudget, TaskBudget
 
 DEFAULT_PERSONAS: list[dict[str, str]] = [
     {
+        "name": "senior_dev_pragmatist",
+        "instructions": (
+            "Prefer the smallest reliable design with explicit ownership. Treat processes, "
+            "containers, temporary files, and ports as leased resources: cap them, transfer a "
+            "lease only to an immediate consumer, and release them when the last consumer exits."
+        ),
+    },
+    {
         "name": "first_principles",
         "instructions": (
             "Reason from explicit invariants, system boundaries, and concrete inputs/outputs "
@@ -75,6 +83,7 @@ class BudgetsConfig:
     max_run_wall_seconds: float = 3600.0
     max_run_disk_bytes: int = 2 * 1024 * 1024 * 1024
     min_free_disk_bytes: int = 256 * 1024 * 1024
+    min_available_memory_mb: int = 2048
     default_task_tokens: int = 100_000
     default_task_wall_seconds: float = 300.0
     default_task_memory_mb: int = 2048
@@ -154,12 +163,18 @@ class KimiProviderConfig:
 @dataclass(slots=True)
 class ContainerConfig:
     enabled: bool = False
+    block_direct_docker: bool = True
     docker_binary: str = "docker"
     image: str = ""
     memory_mb: int = 2048
     pids_limit: int = 256
     network: str | None = None
     read_only: bool = False
+    disk_limit_bytes: int = 512 * 1024 * 1024
+    max_per_run: int = 8
+    handoff_seconds: int = 30
+    log_max_size: str = "10m"
+    log_max_files: int = 3
 
 
 @dataclass(slots=True)
@@ -205,6 +220,7 @@ class OrchestratorConfig:
                 "max_run_wall_seconds": self.budgets.max_run_wall_seconds,
                 "max_run_disk_bytes": self.budgets.max_run_disk_bytes,
                 "min_free_disk_bytes": self.budgets.min_free_disk_bytes,
+                "min_available_memory_mb": self.budgets.min_available_memory_mb,
                 "default_task_tokens": self.budgets.default_task_tokens,
                 "default_task_wall_seconds": self.budgets.default_task_wall_seconds,
                 "default_task_memory_mb": self.budgets.default_task_memory_mb,
@@ -256,12 +272,18 @@ class OrchestratorConfig:
             },
             "container": {
                 "enabled": self.container.enabled,
+                "block_direct_docker": self.container.block_direct_docker,
                 "docker_binary": self.container.docker_binary,
                 "image": self.container.image,
                 "memory_mb": self.container.memory_mb,
                 "pids_limit": self.container.pids_limit,
                 "network": self.container.network,
                 "read_only": self.container.read_only,
+                "disk_limit_bytes": self.container.disk_limit_bytes,
+                "max_per_run": self.container.max_per_run,
+                "handoff_seconds": self.container.handoff_seconds,
+                "log_max_size": self.container.log_max_size,
+                "log_max_files": self.container.log_max_files,
             },
             "mcp_servers": {
                 name: {
@@ -356,6 +378,14 @@ def config_from_dict(data: dict[str, Any], *, base_dir: Path | None = None) -> O
             ),
             min_free_disk_bytes=max(
                 0, int(budgets_raw.get("min_free_disk_bytes", cfg.budgets.min_free_disk_bytes))
+            ),
+            min_available_memory_mb=max(
+                0,
+                int(
+                    budgets_raw.get(
+                        "min_available_memory_mb", cfg.budgets.min_available_memory_mb
+                    )
+                ),
             ),
             default_task_tokens=max(
                 1, int(budgets_raw.get("default_task_tokens", cfg.budgets.default_task_tokens))
@@ -466,12 +496,26 @@ def config_from_dict(data: dict[str, Any], *, base_dir: Path | None = None) -> O
     if cont_raw:
         cfg.container = ContainerConfig(
             enabled=bool(cont_raw.get("enabled", cfg.container.enabled)),
+            block_direct_docker=bool(
+                cont_raw.get("block_direct_docker", cfg.container.block_direct_docker)
+            ),
             docker_binary=str(cont_raw.get("docker_binary", cfg.container.docker_binary)),
             image=str(cont_raw.get("image", cfg.container.image)),
             memory_mb=max(64, int(cont_raw.get("memory_mb", cfg.container.memory_mb))),
             pids_limit=max(16, int(cont_raw.get("pids_limit", cfg.container.pids_limit))),
             network=cont_raw.get("network"),
             read_only=bool(cont_raw.get("read_only", cfg.container.read_only)),
+            disk_limit_bytes=max(
+                1024, int(cont_raw.get("disk_limit_bytes", cfg.container.disk_limit_bytes))
+            ),
+            max_per_run=max(1, int(cont_raw.get("max_per_run", cfg.container.max_per_run))),
+            handoff_seconds=max(
+                1, int(cont_raw.get("handoff_seconds", cfg.container.handoff_seconds))
+            ),
+            log_max_size=str(cont_raw.get("log_max_size", cfg.container.log_max_size)),
+            log_max_files=max(
+                1, int(cont_raw.get("log_max_files", cfg.container.log_max_files))
+            ),
         )
 
     mcp_raw = data.get("mcp_servers", {})
@@ -546,6 +590,7 @@ def config_to_toml(cfg: OrchestratorConfig) -> str:
             f"max_run_wall_seconds = {cfg.budgets.max_run_wall_seconds}",
             f"max_run_disk_bytes = {cfg.budgets.max_run_disk_bytes}",
             f"min_free_disk_bytes = {cfg.budgets.min_free_disk_bytes}",
+            f"min_available_memory_mb = {cfg.budgets.min_available_memory_mb}",
             f"default_task_tokens = {cfg.budgets.default_task_tokens}",
             f"default_task_wall_seconds = {cfg.budgets.default_task_wall_seconds}",
             f"default_task_memory_mb = {cfg.budgets.default_task_memory_mb}",
@@ -615,11 +660,17 @@ def config_to_toml(cfg: OrchestratorConfig) -> str:
             "",
             "[container]",
             f"enabled = {_toml_val(cfg.container.enabled)}",
+            f"block_direct_docker = {_toml_val(cfg.container.block_direct_docker)}",
             f"docker_binary = {_toml_val(cfg.container.docker_binary)}",
             f"image = {_toml_val(cfg.container.image)}",
             f"memory_mb = {cfg.container.memory_mb}",
             f"pids_limit = {cfg.container.pids_limit}",
             f"read_only = {_toml_val(cfg.container.read_only)}",
+            f"disk_limit_bytes = {cfg.container.disk_limit_bytes}",
+            f"max_per_run = {cfg.container.max_per_run}",
+            f"handoff_seconds = {cfg.container.handoff_seconds}",
+            f"log_max_size = {_toml_val(cfg.container.log_max_size)}",
+            f"log_max_files = {cfg.container.log_max_files}",
         ]
     )
     if cfg.container.network:

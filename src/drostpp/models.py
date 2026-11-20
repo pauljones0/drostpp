@@ -66,6 +66,14 @@ class BlackboardKind(StrEnum):
     ARTIFACT_REF = "artifact_ref"
 
 
+class ResourceStatus(StrEnum):
+    PREPARING = "preparing"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    LOST = "lost"
+
+
 class OrchestratorError(Exception):
     """Base error for orchestrator runtime failures."""
 
@@ -285,6 +293,14 @@ class FollowUpProposal:
 
 
 @dataclass(slots=True)
+class ResourceHandoff:
+    """Keep one managed resource for a named immediate follow-up task."""
+
+    resource_key: str
+    to_task_title: str
+
+
+@dataclass(slots=True)
 class WorkerOutput:
     status: str
     summary: str
@@ -293,8 +309,26 @@ class WorkerOutput:
     findings: list[dict[str, Any]] = field(default_factory=list)
     notes: list[dict[str, Any]] = field(default_factory=list)
     follow_up_tasks: list[FollowUpProposal] = field(default_factory=list)
+    resource_handoffs: list[ResourceHandoff] = field(default_factory=list)
     blocker_reason: str | None = None
     raw_text: str = ""
+
+
+@dataclass(slots=True)
+class ManagedResource:
+    resource_id: str
+    run_id: str
+    resource_key: str
+    kind: str
+    external_id: str
+    name: str
+    status: ResourceStatus
+    memory_limit_mb: int
+    disk_limit_bytes: int
+    metadata_json: str
+    created_at: str
+    updated_at: str
+    stopped_at: str | None
 
 
 @dataclass(slots=True)

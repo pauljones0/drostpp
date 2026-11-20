@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
+import os
 from pathlib import Path
 import signal
+import sys
 import threading
-import time
 from typing import Any
 
 from .adapters.base import AttemptContext, WORKER_OUTPUT_JSON_SCHEMA, WorkerAdapter
@@ -27,7 +28,9 @@ from .models import (
     ErrorKind,
     FencedAttemptError,
     FollowUpProposal,
+    IllegalTransitionError,
     McpServerConfig,
+    ManagedResource,
     RunPhase,
     RunRecord,
     TaskBudget,
@@ -37,6 +40,7 @@ from .models import (
     WorkerOutput,
 )
 from .routing import ModelRouter
+from .resources import ResourceManager
 from .store import CoordinatorLock, SQLiteStore
 from .supervision import DockerRunner, ProcessSupervisor, terminate_process_group
 
@@ -64,6 +68,17 @@ class Coordinator:
         self.supervisor = ProcessSupervisor()
         self.docker = DockerRunner(self.config.container.docker_binary)
         self.budget_tracker = BudgetTracker(self.config.budgets.to_run_budget())
+        self.budget_tracker.set_host_memory_floor(
+            self.config.budgets.min_available_memory_mb
+        )
+        self.resources = ResourceManager(
+            self.store,
+            self.config.container,
+            docker=self.docker,
+            attempt_lease_seconds=self.config.run.lease_seconds,
+            min_available_memory_mb=self.config.budgets.min_available_memory_mb,
+            min_free_disk_bytes=self.config.budgets.min_free_disk_bytes,
+        )
         self._shutdown_event = threading.Event()
 
         if adapters is not None:
@@ -100,10 +115,39 @@ class Coordinator:
     def acquire_lock(self) -> CoordinatorLock:
         return CoordinatorLock(self.state_dir / "coordinator.lock", self.store.db_path)
 
-    def _active_mcp_servers(self) -> list[McpServerConfig]:
+    def _active_mcp_servers(
+        self, run_id: str, task_id: str, attempt_id: str, generation: int
+    ) -> list[McpServerConfig]:
         servers = [srv for srv in self.config.mcp_servers.values() if srv.enabled]
         if self.config.drost.enabled:
-            servers.append(build_drost_mcp_config(self.config.drost))
+            drost_server = build_drost_mcp_config(self.config.drost)
+            if self.config.container.enabled and self.config.container.block_direct_docker:
+                drost_server.args = [
+                    "-m",
+                    "drostpp.docker_passthrough",
+                    drost_server.command,
+                    *drost_server.args,
+                ]
+                drost_server.command = sys.executable
+            servers.append(drost_server)
+        if self.config.container.enabled:
+            servers = [srv for srv in servers if srv.name != "drostpp_resources"]
+            servers.append(
+                McpServerConfig(
+                    name="drostpp_resources",
+                    command=sys.executable,
+                    args=["-m", "drostpp.resource_mcp"],
+                    env={
+                        "DROSTPP_STATE_DIR": str(self.state_dir),
+                        "DROSTPP_RUN_ID": run_id,
+                        "DROSTPP_TASK_ID": task_id,
+                        "DROSTPP_ATTEMPT_ID": attempt_id,
+                        "DROSTPP_GENERATION": str(generation),
+                    },
+                    timeout_seconds=max(300.0, self.config.run.lease_seconds),
+                    max_result_bytes=self.config.budgets.max_output_bytes,
+                )
+            )
         return servers
 
     def create_run(
@@ -131,8 +175,8 @@ class Coordinator:
                 terminate_process_group(att.pgid, grace_seconds=0.5, hard_wait_seconds=1.5)
             if att.container_id:
                 self.docker.force_remove_container(att.container_id)
-        if self.config.container.enabled or any(a.container_id for a in stale):
-            self.docker.reap_labeled_containers(run_id)
+            self.resources.release_attempt(att.attempt_id)
+        self.resources.reap(run_id)
         return stale
 
     def _sync_drost_if_configured(self, run: RunRecord) -> None:
@@ -205,6 +249,7 @@ class Coordinator:
                 RunPhase.FAILED,
                 RunPhase.CANCELLED,
             ):
+                self.resources.close_run(run_id)
                 return run_rec
 
             self._sync_drost_if_configured(run_rec)
@@ -212,6 +257,7 @@ class Coordinator:
             while not self._shutdown_event.is_set():
                 run_rec = self.store.get_run(run_id)
                 assert run_rec is not None
+                self.resources.reap(run_id)
 
                 if run_rec.phase == RunPhase.INIT:
                     self._handle_init(run_rec)
@@ -240,6 +286,13 @@ class Coordinator:
                 )
                 final = self.store.get_run(run_id)
                 assert final is not None
+            if final.phase in (
+                RunPhase.PAUSED,
+                RunPhase.COMPLETED,
+                RunPhase.FAILED,
+                RunPhase.CANCELLED,
+            ):
+                self.resources.close_run(run_id)
             return final
         finally:
             self._restore_signal_handlers(old_handlers)
@@ -296,6 +349,22 @@ class Coordinator:
                 RunPhase.RUNNING,
                 actor="coordinator",
                 reason="plan already materialized",
+            )
+            return
+
+        try:
+            disk_bytes = self.budget_tracker.check_run_admission(
+                run_rec,
+                self.state_dir,
+                reserve_memory_mb=self.config.budgets.default_task_memory_mb,
+            )
+            self.store.update_run_disk_bytes(run_rec.run_id, disk_bytes)
+        except BudgetExceededError as exc:
+            self.store.transition_run_phase(
+                run_rec.run_id,
+                RunPhase.FAILED,
+                actor="coordinator",
+                error_message=str(exc),
             )
             return
 
@@ -518,6 +587,8 @@ class Coordinator:
                         terminate_process_group(exp_att.pgid, grace_seconds=0.5)
                     if exp_att.container_id:
                         self.docker.force_remove_container(exp_att.container_id)
+                    self.resources.release_attempt(exp_att.attempt_id)
+                self.resources.reap(run_id)
 
                 run_rec = self.store.get_run(run_id)
                 assert run_rec is not None
@@ -541,7 +612,12 @@ class Coordinator:
                     assert latest_run is not None
                     try:
                         disk_bytes = self.budget_tracker.check_run_admission(
-                            latest_run, self.state_dir
+                            latest_run,
+                            self.state_dir,
+                            reserve_memory_mb=(
+                                (len(active) + 1)
+                                * self.config.budgets.default_task_memory_mb
+                            ),
                         )
                         self.store.update_run_disk_bytes(run_id, disk_bytes)
                     except BudgetExceededError as exc:
@@ -616,11 +692,13 @@ class Coordinator:
             max_chars=10_000,
             exclude_task_id=task.task_id,
         )
+        managed_resources = self.store.list_attempt_managed_resources(attempt.attempt_id)
         prompt = self._build_worker_prompt(
             run_rec=run_rec,
             task=task,
             diversity_block=diversity_block,
             blackboard_context=bb_context,
+            managed_resources=managed_resources,
         )
 
         hb_stop = threading.Event()
@@ -677,7 +755,12 @@ class Coordinator:
                 cancel_ev.set()
 
         routes = self.router.resolve_routes(role=task.role, tier=task.tier)
-        mcp_servers = self._active_mcp_servers()
+        mcp_servers = self._active_mcp_servers(
+            run_rec.run_id,
+            task.task_id,
+            attempt.attempt_id,
+            attempt.generation,
+        )
         final_result = AttemptResult(
             success=False,
             error_kind=ErrorKind.HARD_ERROR,
@@ -717,6 +800,24 @@ class Coordinator:
                     cancel_event=cancel_ev,
                     on_runtime_attached=_on_runtime,
                     on_heartbeat=_on_hb,
+                    env={
+                        "DROSTPP_STATE_DIR": str(self.state_dir),
+                        "DROSTPP_RUN_ID": run_rec.run_id,
+                        "DROSTPP_TASK_ID": task.task_id,
+                        "DROSTPP_ATTEMPT_ID": attempt.attempt_id,
+                        "DROSTPP_GENERATION": str(attempt.generation),
+                        **(
+                            {
+                                "DROSTPP_REAL_DOCKER_HOST": os.environ.get("DOCKER_HOST", ""),
+                                "DOCKER_HOST": (
+                                    f"unix://{self.state_dir}/managed-containers-only.sock"
+                                ),
+                            }
+                            if self.config.container.enabled
+                            and self.config.container.block_direct_docker
+                            else {}
+                        ),
+                    },
                 )
                 try:
                     res = adapter.execute(ctx)
@@ -797,6 +898,14 @@ class Coordinator:
                 task,
                 output.follow_up_tasks,
             )
+            self._apply_resource_handoffs(
+                run_rec.run_id,
+                task.task_id,
+                attempt.attempt_id,
+                attempt.generation,
+                output,
+                created_follow_ups,
+            )
             self.store.complete_attempt(
                 task.task_id,
                 attempt.attempt_id,
@@ -814,6 +923,58 @@ class Coordinator:
         except FencedAttemptError:
             # Stale worker was fenced; rejection audit already recorded in store.
             return
+        finally:
+            self.resources.release_attempt(attempt.attempt_id)
+
+    def _apply_resource_handoffs(
+        self,
+        run_id: str,
+        task_id: str,
+        attempt_id: str,
+        generation: int,
+        output: WorkerOutput,
+        created_follow_up_ids: list[str],
+    ) -> None:
+        """Reserve explicitly named resources only for follow-ups created by this output."""
+        if not output.resource_handoffs:
+            return
+        created_tasks = [
+            task
+            for task_id in created_follow_up_ids
+            if (task := self.store.get_task(task_id)) is not None
+        ]
+        title_to_id = {task.title.strip().lower(): task.task_id for task in created_tasks}
+        seen_keys: set[str] = set()
+        for handoff in output.resource_handoffs:
+            normalized_title = handoff.to_task_title.strip().lower()
+            target_id = title_to_id.get(normalized_title)
+            if target_id is None:
+                continue
+            if handoff.resource_key in seen_keys:
+                continue
+            try:
+                self.resources.handoff(
+                    run_id=run_id,
+                    from_attempt_id=attempt_id,
+                    to_task_id=target_id,
+                    resource_key=handoff.resource_key,
+                )
+                seen_keys.add(handoff.resource_key)
+            except (IllegalTransitionError, ValueError) as exc:
+                self.blackboard.publish(
+                    run_id,
+                    BlackboardKind.NOTE,
+                    "Managed resource handoff rejected",
+                    (
+                        f"Resource {handoff.resource_key!r} was not kept for "
+                        f"{handoff.to_task_title!r}: {exc}"
+                    ),
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    generation=generation,
+                    tags=["resource", "handoff", "warning"],
+                    confidence=1.0,
+                )
 
     def _commit_blackboard_items(
         self,
@@ -897,6 +1058,7 @@ class Coordinator:
         task: TaskRecord,
         diversity_block: str,
         blackboard_context: str,
+        managed_resources: list[ManagedResource],
     ) -> str:
         drost_section = ""
         if self.config.drost.enabled:
@@ -911,6 +1073,32 @@ class Coordinator:
                 f"Configured Drost MCP mode: `{self.config.drost.mcp_mode}`.\n"
             )
 
+        resource_section = ""
+        if self.config.container.enabled:
+            reservations = (
+                "\n".join(
+                    f"- `{resource.resource_key}`: container `{resource.name}` "
+                    f"(id `{resource.external_id[:12]}`)"
+                    for resource in managed_resources
+                )
+                if managed_resources
+                else "- None"
+            )
+            resource_section = (
+                "\n## Managed Container Ownership\n"
+                "All task-created Docker containers MUST go through the Drost++ resource broker. "
+                "Do not invoke `docker run` directly. Prefer the `drostpp_resources` MCP tools; "
+                "from a shell, start one with "
+                "`drost++ resource start --key NAME --image IMAGE -- COMMAND...`; borrow an "
+                "existing one with `drost++ resource borrow --key NAME`. The broker applies RAM, "
+                "PID, log, and writable-layer caps. It removes the container when the last borrower "
+                "exits. To keep one only for an immediate follow-up, include both that follow-up in "
+                "`follow_up_tasks` and `{\"resource_key\": NAME, \"to_task_title\": TITLE}` in "
+                "`resource_handoffs`. Handoffs expire quickly if the consumer does not start.\n"
+                "Resources already reserved for this task:\n"
+                f"{reservations}\n"
+            )
+
         return (
             f"# Orchestration Task ({task.kind.upper()} / role={task.role})\n"
             f"Run ID: {run_rec.run_id}\n"
@@ -919,6 +1107,7 @@ class Coordinator:
             f"## Task Mandate: {task.title}\n{task.prompt}\n\n"
             f"## Diversity & Exploration Framing\n{diversity_block}\n"
             f"{drost_section}\n"
+            f"{resource_section}\n"
             f"## Shared Blackboard Context\n{blackboard_context}\n\n"
             "## Required Response Format\n"
             "Respond with a single JSON object conforming strictly to this schema:\n"

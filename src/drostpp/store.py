@@ -24,6 +24,8 @@ from .models import (
     ErrorKind,
     FencedAttemptError,
     IllegalTransitionError,
+    ManagedResource,
+    ResourceStatus,
     RunBudget,
     RunPhase,
     RunRecord,
@@ -136,6 +138,44 @@ CREATE TABLE IF NOT EXISTS attempts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_attempts_run_status ON attempts(run_id, status, lease_expires_at);
+
+CREATE TABLE IF NOT EXISTS managed_resources (
+    resource_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    resource_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    memory_limit_mb INTEGER NOT NULL,
+    disk_limit_bytes INTEGER NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    stopped_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_managed_resources_run_status
+    ON managed_resources(run_id, status, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_resources_active_key
+    ON managed_resources(run_id, resource_key) WHERE status = 'running';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_resources_owned_key
+    ON managed_resources(run_id, resource_key)
+    WHERE status IN ('preparing', 'running', 'stopping');
+
+CREATE TABLE IF NOT EXISTS resource_leases (
+    resource_id TEXT NOT NULL REFERENCES managed_resources(resource_id) ON DELETE CASCADE,
+    holder_kind TEXT NOT NULL CHECK(holder_kind IN ('attempt', 'task')),
+    holder_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (resource_id, holder_kind, holder_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_resource_leases_expiry
+    ON resource_leases(expires_at, holder_kind, holder_id);
 
 CREATE TABLE IF NOT EXISTS blackboard_entries (
     entry_id TEXT PRIMARY KEY,
@@ -357,6 +397,24 @@ def _row_to_artifact(row: sqlite3.Row) -> ArtifactRecord:
         media_type=row["media_type"],
         metadata=json.loads(row["metadata_json"]),
         created_at=row["created_at"],
+    )
+
+
+def _row_to_managed_resource(row: sqlite3.Row) -> ManagedResource:
+    return ManagedResource(
+        resource_id=row["resource_id"],
+        run_id=row["run_id"],
+        resource_key=row["resource_key"],
+        kind=row["kind"],
+        external_id=row["external_id"],
+        name=row["name"],
+        status=ResourceStatus(row["status"]),
+        memory_limit_mb=int(row["memory_limit_mb"]),
+        disk_limit_bytes=int(row["disk_limit_bytes"]),
+        metadata_json=row["metadata_json"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        stopped_at=row["stopped_at"],
     )
 
 
@@ -1065,6 +1123,22 @@ class SQLiteStore:
                     now,
                 ),
             )
+            conn.execute(
+                """
+                DELETE FROM resource_leases
+                WHERE holder_kind = 'task' AND holder_id = ? AND expires_at <= ?
+                """,
+                (candidate["task_id"], now),
+            )
+            conn.execute(
+                """
+                UPDATE resource_leases
+                SET holder_kind = 'attempt', holder_id = ?, generation = ?,
+                    expires_at = ?, updated_at = ?
+                WHERE holder_kind = 'task' AND holder_id = ? AND expires_at > ?
+                """,
+                (attempt_id, new_gen, lease_exp, now, candidate["task_id"], now),
+            )
             self._append_event(
                 conn,
                 run_id,
@@ -1164,6 +1238,14 @@ class SQLiteStore:
                     total_tokens,
                     attempt_id,
                 ),
+            )
+            conn.execute(
+                """
+                UPDATE resource_leases
+                SET expires_at = ?, updated_at = ?
+                WHERE holder_kind = 'attempt' AND holder_id = ? AND generation = ?
+                """,
+                (lease_exp, now, attempt_id, generation),
             )
             row = conn.execute("SELECT * FROM attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
             assert row is not None
@@ -1577,6 +1659,595 @@ class SQLiteStore:
                     (run_id,),
                 ).fetchall()
             return [_row_to_attempt(r) for r in rows]
+
+    def get_managed_resource(self, run_id: str, resource_key: str) -> ManagedResource | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM managed_resources
+                WHERE run_id = ? AND resource_key = ?
+                ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END, created_at DESC
+                LIMIT 1
+                """,
+                (run_id, resource_key),
+            ).fetchone()
+            return _row_to_managed_resource(row) if row is not None else None
+
+    def list_managed_resources(
+        self, run_id: str, *, status: ResourceStatus | None = None
+    ) -> list[ManagedResource]:
+        with self._lock:
+            if status is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM managed_resources WHERE run_id = ? ORDER BY created_at",
+                    (run_id,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM managed_resources
+                    WHERE run_id = ? AND status = ? ORDER BY created_at
+                    """,
+                    (run_id, status),
+                ).fetchall()
+            return [_row_to_managed_resource(row) for row in rows]
+
+    def prepare_managed_resource(
+        self,
+        *,
+        run_id: str,
+        resource_key: str,
+        kind: str,
+        name: str,
+        memory_limit_mb: int,
+        disk_limit_bytes: int,
+        task_id: str,
+        attempt_id: str,
+        generation: int,
+        lease_seconds: int,
+        metadata: dict[str, Any] | None = None,
+        max_per_run: int = 8,
+    ) -> ManagedResource:
+        """Persist ownership before the external container is created."""
+        now_dt = utc_now()
+        now = utc_iso(now_dt)
+        expires = utc_iso(now_dt + timedelta(seconds=max(1, lease_seconds)))
+        resource_id = f"res_{uuid.uuid4().hex[:14]}"
+        with self._txn() as conn:
+            self._assert_active_fence(conn, task_id, attempt_id, generation, actor="resource-manager")
+            owned_count = conn.execute(
+                """
+                SELECT COUNT(*) FROM managed_resources
+                WHERE run_id = ? AND status IN (?, ?, ?)
+                """,
+                (
+                    run_id,
+                    ResourceStatus.PREPARING,
+                    ResourceStatus.RUNNING,
+                    ResourceStatus.STOPPING,
+                ),
+            ).fetchone()[0]
+            if int(owned_count) >= max(1, max_per_run):
+                raise IllegalTransitionError(
+                    f"managed container limit reached ({owned_count} >= {max_per_run})"
+                )
+            conn.execute(
+                """
+                INSERT INTO managed_resources (
+                    resource_id, run_id, resource_key, kind, external_id, name, status,
+                    memory_limit_mb, disk_limit_bytes, metadata_json,
+                    created_at, updated_at, stopped_at
+                ) VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    resource_id,
+                    run_id,
+                    resource_key,
+                    kind,
+                    name,
+                    ResourceStatus.PREPARING,
+                    int(memory_limit_mb),
+                    int(disk_limit_bytes),
+                    json.dumps(metadata or {}, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO resource_leases (
+                    resource_id, holder_kind, holder_id, generation,
+                    expires_at, created_at, updated_at
+                ) VALUES (?, 'attempt', ?, ?, ?, ?, ?)
+                """,
+                (resource_id, attempt_id, generation, expires, now, now),
+            )
+            self._append_event(
+                conn,
+                run_id,
+                "resource.preparing",
+                attempt_id,
+                {"resource_id": resource_id, "resource_key": resource_key, "name": name},
+                ts=now,
+            )
+            row = conn.execute(
+                "SELECT * FROM managed_resources WHERE resource_id = ?", (resource_id,)
+            ).fetchone()
+            assert row is not None
+            return _row_to_managed_resource(row)
+
+    def activate_managed_resource(
+        self,
+        *,
+        resource_id: str,
+        external_id: str,
+        task_id: str,
+        attempt_id: str,
+        generation: int,
+    ) -> ManagedResource:
+        now = utc_iso()
+        with self._txn() as conn:
+            self._assert_active_fence(conn, task_id, attempt_id, generation, actor="resource-manager")
+            updated = conn.execute(
+                """
+                UPDATE managed_resources
+                SET external_id = ?, status = ?, updated_at = ?
+                WHERE resource_id = ? AND status = ?
+                """,
+                (
+                    external_id,
+                    ResourceStatus.RUNNING,
+                    now,
+                    resource_id,
+                    ResourceStatus.PREPARING,
+                ),
+            )
+            if updated.rowcount != 1:
+                existing = conn.execute(
+                    "SELECT * FROM managed_resources WHERE resource_id = ?", (resource_id,)
+                ).fetchone()
+                if (
+                    existing is not None
+                    and existing["status"] == ResourceStatus.RUNNING
+                    and existing["external_id"] == external_id
+                ):
+                    return _row_to_managed_resource(existing)
+                raise IllegalTransitionError("managed resource was reclaimed before activation")
+            row = conn.execute(
+                "SELECT * FROM managed_resources WHERE resource_id = ?", (resource_id,)
+            ).fetchone()
+            assert row is not None
+            self._append_event(
+                conn,
+                row["run_id"],
+                "resource.started",
+                attempt_id,
+                {
+                    "resource_id": resource_id,
+                    "resource_key": row["resource_key"],
+                    "external_id": external_id,
+                    "memory_limit_mb": int(row["memory_limit_mb"]),
+                    "disk_limit_bytes": int(row["disk_limit_bytes"]),
+                },
+                ts=now,
+            )
+            return _row_to_managed_resource(row)
+
+    def adopt_prepared_resource(
+        self, resource_id: str, external_id: str
+    ) -> ManagedResource | None:
+        """Recover Docker success after its caller died before persisting activation."""
+        now = utc_iso()
+        with self._txn() as conn:
+            updated = conn.execute(
+                """
+                UPDATE managed_resources
+                SET external_id = ?, status = ?, updated_at = ?
+                WHERE resource_id = ? AND status = ? AND EXISTS (
+                    SELECT 1 FROM resource_leases l
+                    WHERE l.resource_id = managed_resources.resource_id AND l.expires_at > ?
+                )
+                """,
+                (
+                    external_id,
+                    ResourceStatus.RUNNING,
+                    now,
+                    resource_id,
+                    ResourceStatus.PREPARING,
+                    now,
+                ),
+            )
+            if updated.rowcount != 1:
+                return None
+            row = conn.execute(
+                "SELECT * FROM managed_resources WHERE resource_id = ?", (resource_id,)
+            ).fetchone()
+            assert row is not None
+            self._append_event(
+                conn,
+                row["run_id"],
+                "resource.adopted",
+                "resource-manager",
+                {
+                    "resource_id": resource_id,
+                    "resource_key": row["resource_key"],
+                    "external_id": external_id,
+                },
+                ts=now,
+            )
+            return _row_to_managed_resource(row)
+
+    def borrow_managed_resource(
+        self,
+        *,
+        run_id: str,
+        resource_key: str,
+        task_id: str,
+        attempt_id: str,
+        generation: int,
+        lease_seconds: int,
+    ) -> ManagedResource:
+        now_dt = utc_now()
+        now = utc_iso(now_dt)
+        expires = utc_iso(now_dt + timedelta(seconds=max(1, lease_seconds)))
+        with self._txn() as conn:
+            self._assert_active_fence(conn, task_id, attempt_id, generation, actor="resource-manager")
+            row = conn.execute(
+                """
+                SELECT * FROM managed_resources
+                WHERE run_id = ? AND resource_key = ? AND status = ?
+                """,
+                (run_id, resource_key, ResourceStatus.RUNNING),
+            ).fetchone()
+            if row is None:
+                raise IllegalTransitionError(f"no running managed resource {resource_key!r}")
+            conn.execute(
+                """
+                INSERT INTO resource_leases (
+                    resource_id, holder_kind, holder_id, generation,
+                    expires_at, created_at, updated_at
+                ) VALUES (?, 'attempt', ?, ?, ?, ?, ?)
+                ON CONFLICT(resource_id, holder_kind, holder_id) DO UPDATE SET
+                    generation = excluded.generation,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (row["resource_id"], attempt_id, generation, expires, now, now),
+            )
+            self._append_event(
+                conn,
+                run_id,
+                "resource.borrowed",
+                attempt_id,
+                {"resource_id": row["resource_id"], "resource_key": resource_key},
+                ts=now,
+            )
+            return _row_to_managed_resource(row)
+
+    def reserve_managed_resource_for_task(
+        self,
+        *,
+        run_id: str,
+        resource_key: str,
+        from_attempt_id: str,
+        to_task_id: str,
+        lease_seconds: int,
+    ) -> ManagedResource:
+        now_dt = utc_now()
+        now = utc_iso(now_dt)
+        expires = utc_iso(now_dt + timedelta(seconds=max(1, lease_seconds)))
+        with self._txn() as conn:
+            row = conn.execute(
+                """
+                SELECT r.* FROM managed_resources r
+                JOIN resource_leases l ON l.resource_id = r.resource_id
+                WHERE r.run_id = ? AND r.resource_key = ? AND r.status = ?
+                  AND l.holder_kind = 'attempt' AND l.holder_id = ? AND l.expires_at > ?
+                """,
+                (run_id, resource_key, ResourceStatus.RUNNING, from_attempt_id, now),
+            ).fetchone()
+            task = conn.execute(
+                "SELECT run_id, status FROM tasks WHERE task_id = ?", (to_task_id,)
+            ).fetchone()
+            if row is None or task is None or task["run_id"] != run_id:
+                raise IllegalTransitionError("resource handoff does not belong to this run")
+            if task["status"] not in (TaskStatus.PENDING, TaskStatus.READY):
+                raise IllegalTransitionError("resource handoff target is not waiting to run")
+            conn.execute(
+                """
+                UPDATE resource_leases
+                SET holder_kind = 'task', holder_id = ?, generation = 0,
+                    expires_at = ?, updated_at = ?
+                WHERE resource_id = ? AND holder_kind = 'attempt' AND holder_id = ?
+                """,
+                (to_task_id, expires, now, row["resource_id"], from_attempt_id),
+            )
+            self._append_event(
+                conn,
+                run_id,
+                "resource.handed_off",
+                from_attempt_id,
+                {
+                    "resource_id": row["resource_id"],
+                    "resource_key": resource_key,
+                    "to_task_id": to_task_id,
+                    "expires_at": expires,
+                },
+                ts=now,
+            )
+            return _row_to_managed_resource(row)
+
+    def release_attempt_resource_leases(self, attempt_id: str) -> list[ManagedResource]:
+        now = utc_iso()
+        with self._txn() as conn:
+            rows = conn.execute(
+                """
+                SELECT r.* FROM managed_resources r
+                JOIN resource_leases l ON l.resource_id = r.resource_id
+                WHERE l.holder_kind = 'attempt' AND l.holder_id = ?
+                """,
+                (attempt_id,),
+            ).fetchall()
+            conn.execute(
+                "DELETE FROM resource_leases WHERE holder_kind = 'attempt' AND holder_id = ?",
+                (attempt_id,),
+            )
+            reclaimable: list[ManagedResource] = []
+            for row in rows:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM resource_leases WHERE resource_id = ? AND expires_at > ?",
+                    (row["resource_id"], now),
+                ).fetchone()[0]
+                if int(count) == 0:
+                    updated = conn.execute(
+                        """
+                        UPDATE managed_resources SET status = ?, updated_at = ?
+                        WHERE resource_id = ? AND status IN (?, ?)
+                        """,
+                        (
+                            ResourceStatus.STOPPING,
+                            now,
+                            row["resource_id"],
+                            ResourceStatus.PREPARING,
+                            ResourceStatus.RUNNING,
+                        ),
+                    )
+                    if updated.rowcount == 1:
+                        claimed = conn.execute(
+                            "SELECT * FROM managed_resources WHERE resource_id = ?",
+                            (row["resource_id"],),
+                        ).fetchone()
+                        assert claimed is not None
+                        reclaimable.append(_row_to_managed_resource(claimed))
+            return reclaimable
+
+    def release_attempt_resource_lease(
+        self, attempt_id: str, resource_key: str
+    ) -> list[ManagedResource]:
+        now = utc_iso()
+        with self._txn() as conn:
+            row = conn.execute(
+                """
+                SELECT r.* FROM managed_resources r
+                JOIN resource_leases l ON l.resource_id = r.resource_id
+                WHERE l.holder_kind = 'attempt' AND l.holder_id = ?
+                  AND r.resource_key = ? AND r.status IN (?, ?)
+                """,
+                (
+                    attempt_id,
+                    resource_key,
+                    ResourceStatus.PREPARING,
+                    ResourceStatus.RUNNING,
+                ),
+            ).fetchone()
+            if row is None:
+                return []
+            conn.execute(
+                """
+                DELETE FROM resource_leases
+                WHERE resource_id = ? AND holder_kind = 'attempt' AND holder_id = ?
+                """,
+                (row["resource_id"], attempt_id),
+            )
+            count = conn.execute(
+                "SELECT COUNT(*) FROM resource_leases WHERE resource_id = ? AND expires_at > ?",
+                (row["resource_id"], now),
+            ).fetchone()[0]
+            if int(count) != 0:
+                return []
+            updated = conn.execute(
+                """
+                UPDATE managed_resources SET status = ?, updated_at = ?
+                WHERE resource_id = ? AND status IN (?, ?)
+                """,
+                (
+                    ResourceStatus.STOPPING,
+                    now,
+                    row["resource_id"],
+                    ResourceStatus.PREPARING,
+                    ResourceStatus.RUNNING,
+                ),
+            )
+            if updated.rowcount != 1:
+                return []
+            claimed = conn.execute(
+                "SELECT * FROM managed_resources WHERE resource_id = ?", (row["resource_id"],)
+            ).fetchone()
+            assert claimed is not None
+            return [_row_to_managed_resource(claimed)]
+
+    def expire_resource_leases(self, run_id: str) -> list[ManagedResource]:
+        now = utc_iso()
+        with self._txn() as conn:
+            conn.execute(
+                """
+                DELETE FROM resource_leases
+                WHERE expires_at <= ? AND resource_id IN (
+                    SELECT resource_id FROM managed_resources WHERE run_id = ?
+                )
+                """,
+                (now, run_id),
+            )
+            rows = conn.execute(
+                """
+                SELECT r.* FROM managed_resources r
+                WHERE r.run_id = ? AND r.status IN (?, ?)
+                  AND NOT EXISTS (
+                    SELECT 1 FROM resource_leases l
+                    WHERE l.resource_id = r.resource_id AND l.expires_at > ?
+                  )
+                """,
+                (
+                    run_id,
+                    ResourceStatus.PREPARING,
+                    ResourceStatus.RUNNING,
+                    now,
+                ),
+            ).fetchall()
+            claimed: list[ManagedResource] = []
+            for row in rows:
+                updated = conn.execute(
+                    """
+                    UPDATE managed_resources SET status = ?, updated_at = ?
+                    WHERE resource_id = ? AND status IN (?, ?)
+                    """,
+                    (
+                        ResourceStatus.STOPPING,
+                        now,
+                        row["resource_id"],
+                        ResourceStatus.PREPARING,
+                        ResourceStatus.RUNNING,
+                    ),
+                )
+                if updated.rowcount == 1:
+                    claimed_row = conn.execute(
+                        "SELECT * FROM managed_resources WHERE resource_id = ?",
+                        (row["resource_id"],),
+                    ).fetchone()
+                    assert claimed_row is not None
+                    claimed.append(_row_to_managed_resource(claimed_row))
+            return claimed
+
+    def claim_run_resources_for_stop(self, run_id: str) -> list[ManagedResource]:
+        now = utc_iso()
+        with self._txn() as conn:
+            conn.execute(
+                """
+                UPDATE managed_resources SET status = ?, updated_at = ?
+                WHERE run_id = ? AND status IN (?, ?)
+                """,
+                (
+                    ResourceStatus.STOPPING,
+                    now,
+                    run_id,
+                    ResourceStatus.PREPARING,
+                    ResourceStatus.RUNNING,
+                ),
+            )
+            rows = conn.execute(
+                """
+                SELECT * FROM managed_resources
+                WHERE run_id = ? AND status = ? ORDER BY created_at
+                """,
+                (run_id, ResourceStatus.STOPPING),
+            ).fetchall()
+            return [_row_to_managed_resource(row) for row in rows]
+
+    def claim_managed_resource_for_stop(self, resource_id: str) -> ManagedResource | None:
+        now = utc_iso()
+        with self._txn() as conn:
+            updated = conn.execute(
+                """
+                UPDATE managed_resources SET status = ?, updated_at = ?
+                WHERE resource_id = ? AND status IN (?, ?)
+                """,
+                (
+                    ResourceStatus.STOPPING,
+                    now,
+                    resource_id,
+                    ResourceStatus.PREPARING,
+                    ResourceStatus.RUNNING,
+                ),
+            )
+            if updated.rowcount != 1:
+                row = conn.execute(
+                    "SELECT * FROM managed_resources WHERE resource_id = ?", (resource_id,)
+                ).fetchone()
+                if row is not None and row["status"] == ResourceStatus.STOPPING:
+                    return _row_to_managed_resource(row)
+                return None
+            row = conn.execute(
+                "SELECT * FROM managed_resources WHERE resource_id = ?", (resource_id,)
+            ).fetchone()
+            assert row is not None
+            return _row_to_managed_resource(row)
+
+    def list_task_managed_resources(self, task_id: str) -> list[ManagedResource]:
+        now = utc_iso()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT r.* FROM managed_resources r
+                JOIN resource_leases l ON l.resource_id = r.resource_id
+                WHERE l.holder_kind = 'task' AND l.holder_id = ?
+                  AND l.expires_at > ? AND r.status = ?
+                ORDER BY r.resource_key
+                """,
+                (task_id, now, ResourceStatus.RUNNING),
+            ).fetchall()
+            return [_row_to_managed_resource(row) for row in rows]
+
+    def list_attempt_managed_resources(self, attempt_id: str) -> list[ManagedResource]:
+        now = utc_iso()
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT r.* FROM managed_resources r
+                JOIN resource_leases l ON l.resource_id = r.resource_id
+                WHERE l.holder_kind = 'attempt' AND l.holder_id = ?
+                  AND l.expires_at > ? AND r.status = ?
+                ORDER BY r.resource_key
+                """,
+                (attempt_id, now, ResourceStatus.RUNNING),
+            ).fetchall()
+            return [_row_to_managed_resource(row) for row in rows]
+
+    def mark_managed_resource_stopped(
+        self, resource_id: str, *, lost: bool = False, error: str | None = None
+    ) -> None:
+        now = utc_iso()
+        status = ResourceStatus.LOST if lost else ResourceStatus.STOPPED
+        with self._txn() as conn:
+            row = conn.execute(
+                "SELECT * FROM managed_resources WHERE resource_id = ?", (resource_id,)
+            ).fetchone()
+            if row is None or row["status"] not in (
+                ResourceStatus.RUNNING,
+                ResourceStatus.PREPARING,
+                ResourceStatus.STOPPING,
+            ):
+                return
+            conn.execute(
+                """
+                UPDATE managed_resources
+                SET status = ?, updated_at = ?, stopped_at = ? WHERE resource_id = ?
+                """,
+                (status, now, now, resource_id),
+            )
+            conn.execute("DELETE FROM resource_leases WHERE resource_id = ?", (resource_id,))
+            self._append_event(
+                conn,
+                row["run_id"],
+                "resource.lost" if lost else "resource.stopped",
+                "resource-manager",
+                {
+                    "resource_id": resource_id,
+                    "resource_key": row["resource_key"],
+                    "external_id": row["external_id"],
+                    "error": error,
+                },
+                ts=now,
+            )
 
     def add_blackboard_entry(
         self,
